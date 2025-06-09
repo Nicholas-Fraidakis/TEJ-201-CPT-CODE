@@ -1,6 +1,8 @@
 // I'm too lazy to make my own servo drivers so we will use Arduino's
 #include <Servo.h>
 
+#pragma region CoreEyeballStruct
+
 // Says whether or not out program should be running
 bool IsRunning = true;
 
@@ -21,8 +23,8 @@ struct _AnalogEyeInput
     P.S. ignore that 0 is closed and 100 is wide open,
       That's a feature not a bug ;)
   */
-  float GetBlinkStrength() {
-    return (blinkInput + 100) / 2;
+  uint8_t GetBlinkStrength() {
+    return ((uint16_t)blinkInput + 100) / 2.f;
   }
 };
 
@@ -43,7 +45,7 @@ struct _EyeBall {
   Servo horizontalServo;
 
   // 0% = Fully Closed | 100% = Wide Open
-  void BlinkAmount(float blinkStrength) {
+  void BlinkAmount(uint8_t blinkStrength) {
     // Convert blink strength to an angle
     int angle = map((blinkStrength+1.f/2)*10, 0, 1000, 0, 130);
     blinkServo.write(angle);
@@ -191,8 +193,458 @@ CreateInputMethod(HorizontalDebug) {
   input->horizontalInput = analogRead(A0);
 }
 
+#pragma endregion
+
+#pragma region OcularVirtualMachine
+
+enum OVM_INSTRUCTION_SET {
+  HALT = 0,
+
+  PUSHS,    // Push with size
+  PUSHR,    // Push raw (can be used if the data type is >2 bytes)
+  REMOVE,
+
+  ADD,
+  SUB,
+  MUL,
+  DIV,
+
+  SBS,      // Set Blink strength
+  SEH,      // Set Eye horizontal
+
+  COMP,     // Compares and pushes flag
+  CCLR,     // Clears Comparison
+
+  JP, 
+
+  WAIT,
+
+  SINE,
+  COS,
+  TAN,
+
+  GAI,      // Get Analog Input
+};
+
+enum OVM_COMPARISON {
+  NO_COMPARISON=0,
+  LESS_THAN=1,
+  GREATER_THAN=2,
+  EQUAL_TO=4,
+
+  STACK_EQUALITY_PARAMETER = 128
+};
+
+struct OVM_INSTRUCTION {
+  uint8_t opcode;
+
+  union {
+    struct {
+      uint8_t arg8L;
+      uint8_t arg8U;
+    };
+    uint16_t arg16;
+  };
+
+  uint8_t argA;
+};
+
+struct OVM_PROGRAM {
+  uint16_t length;
+  OVM_INSTRUCTION * instructions;
+};
+
+#define OVM_STACK_SIZE 256
+
+enum OVM_Err {
+  GENERAL_ERROR = 1,
+  STACK_OVERFLOW,
+  STACK_UNDERFLOW,
+  EYENULL
+};
+
+enum OVM_ENCODING_TYPES {
+  UNSIGNED, 
+  FLOATING, 
+  INTEGER
+};
+
+struct OVM_DECODED_ARGS {
+  union {
+    struct {
+      union {
+        uint8_t ENCODING_0;
+        uint8_t arg8L;
+        uint8_t A;
+      };
+      union {
+        uint8_t ENCODING_1;
+        uint8_t arg8U;
+        uint8_t B;
+      };
+    };
+    uint16_t arg16;
+    uint16_t AB;
+  };
+  union {
+    uint8_t OPERAND_SIZE;
+    uint8_t argA;
+    uint8_t C;
+  };
+  uint8_t CONDITIONAL;
+};
+
+struct OVM {
+  bool IS_RUNNING = true;
+  struct _EyeBall * EYE_TARGET;
+
+  uint8_t DATA_STACK[OVM_STACK_SIZE];
+  uint8_t SIZE_STACK[OVM_STACK_SIZE];
+
+  void * STACK_POINTER;
+  uint16_t STACK_INDEX;
+
+  uint16_t ELEMENTS_ALLOCATED;
+
+  struct OVM_PROGRAM PROGRAM;
+
+  uint16_t PROGRAM_COUNTER;
+
+  enum OVM_INSTRUCTION_SET OPCODE;
+  uint8_t CONDITION;
+
+  struct OVM_DECODED_ARGS OPERANDS;
+
+  void panic(const char * msg, const enum OVM_Err err_code) {
+    Serial.print("O.V.M Panic: ");
+    Serial.println(msg);
+
+    Serial.print("Program Counter: ");
+    Serial.println(PROGRAM_COUNTER);
+
+    Serial.print("Terminating Program with Error Code: ");
+    Serial.println(err_code);
+    exit(err_code);
+  }
+
+  void warning(const char * msg, const enum OVM_Err err_code) {
+    Serial.print("O.V.M Warning: ");
+    Serial.println(msg);
+
+    Serial.print("Program Counter: ");
+    Serial.println(PROGRAM_COUNTER);
+
+    Serial.print("Warning Error Code: ");
+    Serial.println(err_code);
+  }
+
+  void info(const char * msg) {
+    Serial.print("O.V.M Info: ");
+    Serial.println(msg);
+
+    Serial.print("Program Counter: ");
+    Serial.println(PROGRAM_COUNTER);
+  }
+
+  void push_with_size(uint16_t data, uint8_t size) {
+    if ((uint16_t)((char*)STACK_POINTER - (char*)DATA_STACK) + size >= OVM_STACK_SIZE) {
+      panic("Stack Overflow!", STACK_OVERFLOW);
+    }
+
+    if (size == 1) {
+      uint8_t * TOP_STACK = (uint8_t*)(STACK_POINTER);
+      *TOP_STACK = (uint8_t)data;
+      TOP_STACK++;
+
+      STACK_POINTER = (void *)TOP_STACK;
+    } else {
+      uint16_t * TOP_STACK = (uint16_t*)(STACK_POINTER);
+      *TOP_STACK = data;
+      TOP_STACK++;
+
+      STACK_POINTER = (void *)TOP_STACK;
+    }
+
+    SIZE_STACK[ELEMENTS_ALLOCATED] = size;
+    ELEMENTS_ALLOCATED++;
+  }
+
+  void push_raw(uint16_t data, bool single_byte) {
+    if ((uint16_t)((char*)STACK_POINTER - (char*)DATA_STACK) + (uint8_t)single_byte + 1 >= OVM_STACK_SIZE) {
+      return panic("Stack Overflow!", STACK_OVERFLOW);
+    }
+    
+    if (!single_byte) {
+      uint8_t * TOP_STACK = (uint8_t*)(STACK_POINTER);
+      *TOP_STACK = (uint8_t)data;
+      TOP_STACK++;
+
+      STACK_POINTER = (void *)TOP_STACK;
+    } else {
+      uint16_t * TOP_STACK = (uint16_t*)(STACK_POINTER);
+      *TOP_STACK = data;
+      TOP_STACK++;
+
+      STACK_POINTER = (void *)TOP_STACK;
+    }
+  }
+
+  uint16_t get_element(void) {
+    if (SIZE_STACK[ELEMENTS_ALLOCATED] == 2) {
+      return ((uint16_t)DATA_STACK[ELEMENTS_ALLOCATED-1] << 8) | DATA_STACK[ELEMENTS_ALLOCATED];
+    }
+    return DATA_STACK[ELEMENTS_ALLOCATED];
+  }
+
+  void remove_element(void) {
+    if ((uint16_t)((char*)STACK_POINTER - (char*)DATA_STACK) - SIZE_STACK[ELEMENTS_ALLOCATED] >= OVM_STACK_SIZE) {
+      ELEMENTS_ALLOCATED = 0;
+      SIZE_STACK[0] = 0;
+
+      STACK_POINTER = DATA_STACK;
+
+      return warning("Stack Underflow, Reseting Stacks!", STACK_UNDERFLOW);
+    }
+
+    uint8_t * TOP_STACK = (uint8_t*)(STACK_POINTER);
+    TOP_STACK -= SIZE_STACK[ELEMENTS_ALLOCATED];
+    STACK_POINTER = TOP_STACK;
+
+    ELEMENTS_ALLOCATED--;
+  }
+
+  uint16_t pop_element(void) {
+    uint16_t element = get_element();
+    remove_element();
+    return element;
+  }
+
+  OVM_INSTRUCTION fetch(void) {
+    return PROGRAM_COUNTER < PROGRAM.length ? 
+      PROGRAM.instructions[PROGRAM_COUNTER++] : 
+      (OVM_INSTRUCTION){.opcode=HALT};
+  }
+
+  void decode(OVM_INSTRUCTION instruction) {
+    OPCODE = (enum OVM_INSTRUCTION_SET)instruction.opcode;
+    
+    OPERANDS = (struct OVM_DECODED_ARGS){0};
+
+    switch (OPCODE) {
+      case PUSHS:
+      case PUSHR:
+        OPERANDS.AB = instruction.arg16;
+        OPERANDS.OPERAND_SIZE = instruction.argA;
+        break;
+      
+      case ADD:
+      case SUB:
+      case MUL:
+      case DIV:
+        OPERANDS.A = instruction.arg8L;
+        OPERANDS.B = instruction.arg8U;
+        OPERANDS.CONDITIONAL = instruction.argA;
+        break;
+
+      case WAIT:
+        OPERANDS.AB = instruction.arg16;
+        OPERANDS.C = instruction.argA;
+        break;
+      case JP:
+        OPERANDS.AB = instruction.arg16;
+        OPERANDS.CONDITIONAL = instruction.argA;
+        break;
+
+      case COMP:
+        OPERANDS.AB = instruction.arg16;
+        OPERANDS.C = instruction.argA;
+        break;
+
+      case SEH:
+      case SBS:
+        OPERANDS.AB = instruction.arg16; 
+        OPERANDS.C = instruction.argA;
+    }
+    
+  }
+
+  void execute(void) {
+    if (OPERANDS.CONDITIONAL && (CONDITION & OPERANDS.CONDITIONAL) == 0) {
+      return;
+    }
+
+    switch (OPCODE) {
+      case HALT:
+        IS_RUNNING = false;
+        info("Program Has Halted!");
+        break;
+
+      case PUSHS:
+        push_with_size(OPERANDS.AB, OPERANDS.OPERAND_SIZE);
+        break;
+
+      case PUSHR:
+        push_raw(OPERANDS.AB, (bool)OPERANDS.C);
+        break;
+
+      case REMOVE:
+        remove_element();
+        break;
+
+      case ADD: {
+        if (ELEMENTS_ALLOCATED == 0) panic("Stack Underflow!", STACK_UNDERFLOW);
+
+        uint8_t size = SIZE_STACK[ELEMENTS_ALLOCATED] > SIZE_STACK[ELEMENTS_ALLOCATED - 1] ? 
+          SIZE_STACK[ELEMENTS_ALLOCATED] : SIZE_STACK[ELEMENTS_ALLOCATED - 1];
+
+        uint16_t number = pop_element() + pop_element();
+
+        push_with_size(number, size);
+        break;
+      }
+
+      case SUB: {
+        if (ELEMENTS_ALLOCATED == 0) panic("Stack Underflow!", STACK_UNDERFLOW);
+
+        uint8_t size = SIZE_STACK[ELEMENTS_ALLOCATED] > SIZE_STACK[ELEMENTS_ALLOCATED - 1] ? 
+          SIZE_STACK[ELEMENTS_ALLOCATED] : SIZE_STACK[ELEMENTS_ALLOCATED - 1];
+
+        uint16_t number = pop_element() - pop_element();
+
+        push_with_size(number, size);
+        break;
+      }
+
+      case MUL: {
+        if (ELEMENTS_ALLOCATED == 0) panic("Stack Underflow!", STACK_UNDERFLOW);
+
+        uint8_t size = SIZE_STACK[ELEMENTS_ALLOCATED] > SIZE_STACK[ELEMENTS_ALLOCATED - 1] ? 
+          SIZE_STACK[ELEMENTS_ALLOCATED] : SIZE_STACK[ELEMENTS_ALLOCATED - 1];
+
+        uint16_t number = pop_element() * pop_element();
+
+        push_with_size(number, size);
+        break;
+      }
+
+      case DIV: {
+        if (ELEMENTS_ALLOCATED == 0) panic("Stack Underflow!", STACK_UNDERFLOW);
+
+        uint8_t size = SIZE_STACK[ELEMENTS_ALLOCATED] > SIZE_STACK[ELEMENTS_ALLOCATED - 1] ? 
+          SIZE_STACK[ELEMENTS_ALLOCATED] : SIZE_STACK[ELEMENTS_ALLOCATED - 1];
+
+        uint16_t number = pop_element() / pop_element();
+
+        push_with_size(number, size);
+        break;
+      }
+
+      case WAIT:
+        if (OPERANDS.C) {
+          if (ELEMENTS_ALLOCATED == 0) panic("Stack Underflow!", STACK_UNDERFLOW);
+
+          delay(pop_element());
+          break;
+        }
+        
+        delay(OPERANDS.AB);
+        break;
+
+      case JP:
+        PROGRAM_COUNTER = OPERANDS.AB;
+        break;
+      
+      case COMP: {
+        if (ELEMENTS_ALLOCATED == 0) panic("Stack Underflow!", STACK_UNDERFLOW);
+
+        uint16_t c1 = pop_element();
+
+        uint16_t c2 = OPERANDS.AB;
+
+        if (OPERANDS.C) {
+          if (ELEMENTS_ALLOCATED == 0) panic("Stack Underflow!", STACK_UNDERFLOW);
+
+          c2 = pop_element();
+        }
+        
+        if (c1 > c2) CONDITION = GREATER_THAN;
+        else if (c1 < c2) CONDITION = LESS_THAN;
+
+        if (c1 == c2) CONDITION |= EQUAL_TO;
+        break;
+      }
+
+      case CCLR:
+        CONDITION = 0;
+        break;
+
+      case SBS:
+        if (!EYE_TARGET) panic("EYE_TARGET is NULL!", EYENULL);
+
+        if (OPERANDS.C) return EYE_TARGET->BlinkAmount(pop_element());
+
+        EYE_TARGET->BlinkAmount(OPERANDS.AB);
+
+        info("EYE is blinking");
+        Serial.println(OPERANDS.AB);
+
+        break;
+
+      case SEH:
+        if (!EYE_TARGET) panic("EYE_TARGET is NULL!", EYENULL);
+
+        if (OPERANDS.C) return EYE_TARGET->LookHorizontal(pop_element());
+
+        EYE_TARGET->LookHorizontal(OPERANDS.AB);
+
+        break;
+    }
+  }
+
+  void run_cycle(void) {
+    if (!IS_RUNNING) return;
+    
+    struct OVM_INSTRUCTION instruction = fetch();
+    decode(instruction);
+    execute();
+
+    info("");
+  }
+};
+
+void OVM_Init(struct OVM * target, struct _EyeBall * eye_target, struct OVM_PROGRAM program) {
+  target->EYE_TARGET = eye_target;
+
+  target->STACK_POINTER = target->DATA_STACK;
+
+  target->PROGRAM = program;
+}
+
+#pragma endregion
+
+#pragma region UserProgram
+
 // This is my eye
 struct _EyeBall myEye;
+struct OVM myOVM;
+
+struct OVM_INSTRUCTION myProgramInstructions[10] = {
+};
+
+void LoadProgram() {
+  myProgramInstructions[0].opcode = SBS;
+  myProgramInstructions[0].arg16 = 100;
+
+  myProgramInstructions[1].opcode = SEH;
+  myProgramInstructions[1].arg16 = 0;
+
+  myProgramInstructions[2].opcode = HALT;
+}
+
+struct OVM_PROGRAM myProgram = (struct OVM_PROGRAM) {
+  sizeof(myProgramInstructions) / sizeof(struct OVM_INSTRUCTION),
+  (struct OVM_INSTRUCTION*)&myProgramInstructions,
+};
 
 // It's this easy to add joystick support :}
 CreateInputMethod(JoystickInput) {
@@ -205,16 +657,24 @@ void setup() {
   // This here is just so you can visually know what each parameter is
   // The compiler will just replace the variable there with the number
   // Instead of pushing it to the stack so no fancy keywords are needed
+
+  Serial.begin(9600);
   int blinkPin = 6;
   int horizontalServo = 3;
 
   myEye = LoadEyeball(blinkPin, horizontalServo, JoystickInput);
+
+  LoadProgram();
+
+  OVM_Init(&myOVM, &myEye, myProgram);
 }
 
 void loop() {
   // All that just for this absolutely beautiful procedure call right here
   // At least it is now a piece of cake to add more eyes and play around with them :D
-  myEye.SetBasedOnInputPlusAutoWhenAfk();
+  myOVM.run_cycle();
 
   delay(10); // We don't want our servos or board to blow up do we
 }
+
+#pragma endregion
