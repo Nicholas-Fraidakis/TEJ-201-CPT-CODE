@@ -1,6 +1,8 @@
 // I'm too lazy to make my own servo drivers so we will use Arduino's
 #include <Servo.h>
 
+#pragma region MonolithicEyeballAbstraction
+
 #pragma region CoreEyeballStruct
 
 // Says whether or not out program should be running
@@ -82,6 +84,7 @@ struct _EyeBall {
     
     // Moves eye
     BlinkAmount(input.GetBlinkStrength());
+    Serial.println(input.GetBlinkStrength());
     LookHorizontal(input.GetLookingHorizontalAmount());
   }
 
@@ -197,12 +200,15 @@ CreateInputMethod(HorizontalDebug) {
 
 #pragma region OcularVirtualMachine
 
+// The instruction set used by the Ocular Virtual Machine
 enum OVM_INSTRUCTION_SET {
   HALT = 0,
 
   PUSHS,    // Push with size
-  PUSHR,    // Push raw (can be used if the data type is >2 bytes)
+  PUSHR,    // Push raw (can be used if the data type is >2 bytes even though it's not supported)
   REMOVE,
+
+  PRINT,
 
   ADD,
   SUB,
@@ -223,22 +229,22 @@ enum OVM_INSTRUCTION_SET {
   COS,
   TAN,
 
-  GAI,      // Get Analog Input
+  CAI,      // Check Analog Input
 };
 
+// Comparison bit flags used in OVM conditionals
 enum OVM_COMPARISON {
   NO_COMPARISON=0,
   LESS_THAN=1,
   GREATER_THAN=2,
   EQUAL_TO=4,
-
-  STACK_EQUALITY_PARAMETER = 128
 };
 
+// Struct representation of an OVM instruction
 struct OVM_INSTRUCTION {
   uint8_t opcode;
 
-  union {
+  union { 
     struct {
       uint8_t arg8L;
       uint8_t arg8U;
@@ -246,16 +252,19 @@ struct OVM_INSTRUCTION {
     uint16_t arg16;
   };
 
-  uint8_t argA;
+  uint8_t argA; // additional argument
 };
 
+// Struct representation of an OVM program
 struct OVM_PROGRAM {
   uint16_t length;
-  OVM_INSTRUCTION * instructions;
+  struct OVM_INSTRUCTION * instructions;
 };
 
+// A macro to define how big each OVM stack should be (total mem = 2x stack size)
 #define OVM_STACK_SIZE 256
 
+// Different OVM errors and warnings
 enum OVM_Err {
   GENERAL_ERROR = 1,
   STACK_OVERFLOW,
@@ -263,22 +272,15 @@ enum OVM_Err {
   EYENULL
 };
 
-enum OVM_ENCODING_TYPES {
-  UNSIGNED, 
-  FLOATING, 
-  INTEGER
-};
-
+// An absolute monster of a struct to represent decoded arguments from an instruction
 struct OVM_DECODED_ARGS {
   union {
     struct {
       union {
-        uint8_t ENCODING_0;
         uint8_t arg8L;
         uint8_t A;
       };
       union {
-        uint8_t ENCODING_1;
         uint8_t arg8U;
         uint8_t B;
       };
@@ -294,17 +296,17 @@ struct OVM_DECODED_ARGS {
   uint8_t CONDITIONAL;
 };
 
+// An OVM instance def
 struct OVM {
   bool IS_RUNNING = true;
   struct _EyeBall * EYE_TARGET;
 
-  uint8_t DATA_STACK[OVM_STACK_SIZE];
-  uint8_t SIZE_STACK[OVM_STACK_SIZE];
+  uint8_t DATA_STACK[OVM_STACK_SIZE]; // holds raw data
+  uint8_t SIZE_STACK[OVM_STACK_SIZE]; // holds element sizes
 
-  void * STACK_POINTER;
-  uint16_t STACK_INDEX;
+  void * STACK_POINTER; // Points to top of stack
 
-  uint16_t ELEMENTS_ALLOCATED;
+  uint16_t ELEMENTS_ALLOCATED; // the number of allocated elements
 
   struct OVM_PROGRAM PROGRAM;
 
@@ -315,6 +317,7 @@ struct OVM {
 
   struct OVM_DECODED_ARGS OPERANDS;
 
+  // Prints a panic and terminates
   void panic(const char * msg, const enum OVM_Err err_code) {
     Serial.print("O.V.M Panic: ");
     Serial.println(msg);
@@ -327,6 +330,7 @@ struct OVM {
     exit(err_code);
   }
 
+  // Prints a warning
   void warning(const char * msg, const enum OVM_Err err_code) {
     Serial.print("O.V.M Warning: ");
     Serial.println(msg);
@@ -338,6 +342,7 @@ struct OVM {
     Serial.println(err_code);
   }
 
+  // Print info 
   void info(const char * msg) {
     Serial.print("O.V.M Info: ");
     Serial.println(msg);
@@ -346,23 +351,21 @@ struct OVM {
     Serial.println(PROGRAM_COUNTER);
   }
 
+  // Pushs an element onto the stack
   void push_with_size(uint16_t data, uint8_t size) {
     if ((uint16_t)((char*)STACK_POINTER - (char*)DATA_STACK) + size >= OVM_STACK_SIZE) {
       panic("Stack Overflow!", STACK_OVERFLOW);
     }
 
     if (size == 1) {
-      uint8_t * TOP_STACK = (uint8_t*)(STACK_POINTER);
-      *TOP_STACK = (uint8_t)data;
-      TOP_STACK++;
+      *(uint8_t*)(STACK_POINTER) = data;
+      STACK_POINTER = (void*)((uint8_t *)STACK_POINTER + 1);
+    } else if (size == 2) {
+      *(uint16_t*)(STACK_POINTER) = data;
 
-      STACK_POINTER = (void *)TOP_STACK;
+      STACK_POINTER = (void*)((uint8_t *)STACK_POINTER + 2);
     } else {
-      uint16_t * TOP_STACK = (uint16_t*)(STACK_POINTER);
-      *TOP_STACK = data;
-      TOP_STACK++;
-
-      STACK_POINTER = (void *)TOP_STACK;
+      panic("You might want to sit down for this... things can only be 8 or 16 bit >:)", GENERAL_ERROR);
     }
 
     SIZE_STACK[ELEMENTS_ALLOCATED] = size;
@@ -370,34 +373,20 @@ struct OVM {
   }
 
   void push_raw(uint16_t data, bool single_byte) {
-    if ((uint16_t)((char*)STACK_POINTER - (char*)DATA_STACK) + (uint8_t)single_byte + 1 >= OVM_STACK_SIZE) {
-      return panic("Stack Overflow!", STACK_OVERFLOW);
-    }
-    
-    if (!single_byte) {
-      uint8_t * TOP_STACK = (uint8_t*)(STACK_POINTER);
-      *TOP_STACK = (uint8_t)data;
-      TOP_STACK++;
-
-      STACK_POINTER = (void *)TOP_STACK;
-    } else {
-      uint16_t * TOP_STACK = (uint16_t*)(STACK_POINTER);
-      *TOP_STACK = data;
-      TOP_STACK++;
-
-      STACK_POINTER = (void *)TOP_STACK;
-    }
+    panic("Deprecated!",GENERAL_ERROR);
   }
 
+  // Returns the last element pushed to staack without poping it
   uint16_t get_element(void) {
-    if (SIZE_STACK[ELEMENTS_ALLOCATED] == 2) {
-      return ((uint16_t)DATA_STACK[ELEMENTS_ALLOCATED-1] << 8) | DATA_STACK[ELEMENTS_ALLOCATED];
+    if (SIZE_STACK[ELEMENTS_ALLOCATED-1] == 2) {
+      return *(uint16_t*)((uint8_t*)(STACK_POINTER)-2);
     }
-    return DATA_STACK[ELEMENTS_ALLOCATED];
+    return *((uint8_t*)(STACK_POINTER)-1);
   }
 
+  // Frees stack mem
   void remove_element(void) {
-    if ((uint16_t)((char*)STACK_POINTER - (char*)DATA_STACK) - SIZE_STACK[ELEMENTS_ALLOCATED] >= OVM_STACK_SIZE) {
+    if ((uint16_t)((char*)STACK_POINTER - (char*)DATA_STACK) - SIZE_STACK[ELEMENTS_ALLOCATED-1] >= OVM_STACK_SIZE) {
       ELEMENTS_ALLOCATED = 0;
       SIZE_STACK[0] = 0;
 
@@ -407,24 +396,27 @@ struct OVM {
     }
 
     uint8_t * TOP_STACK = (uint8_t*)(STACK_POINTER);
-    TOP_STACK -= SIZE_STACK[ELEMENTS_ALLOCATED];
+    TOP_STACK -= SIZE_STACK[ELEMENTS_ALLOCATED-1];
     STACK_POINTER = TOP_STACK;
 
     ELEMENTS_ALLOCATED--;
   }
 
+  // Pops element from stack
   uint16_t pop_element(void) {
     uint16_t element = get_element();
     remove_element();
     return element;
   }
 
+  // fetches and returns instruction
   OVM_INSTRUCTION fetch(void) {
     return PROGRAM_COUNTER < PROGRAM.length ? 
       PROGRAM.instructions[PROGRAM_COUNTER++] : 
       (OVM_INSTRUCTION){.opcode=HALT};
   }
 
+  // Decodes the arguments from an instruction
   void decode(OVM_INSTRUCTION instruction) {
     OPCODE = (enum OVM_INSTRUCTION_SET)instruction.opcode;
     
@@ -464,10 +456,16 @@ struct OVM {
       case SBS:
         OPERANDS.AB = instruction.arg16; 
         OPERANDS.C = instruction.argA;
+      case CAI:
+        OPERANDS.AB = instruction.arg16;
+        OPERANDS.C = instruction.argA;
+      default:
+        break;
     }
     
   }
 
+  // runs the instruction
   void execute(void) {
     if (OPERANDS.CONDITIONAL && (CONDITION & OPERANDS.CONDITIONAL) == 0) {
       return;
@@ -478,7 +476,8 @@ struct OVM {
         IS_RUNNING = false;
         info("Program Has Halted!");
         break;
-
+      case PRINT:
+        Serial.println(get_element());
       case PUSHS:
         push_with_size(OPERANDS.AB, OPERANDS.OPERAND_SIZE);
         break;
@@ -492,14 +491,16 @@ struct OVM {
         break;
 
       case ADD: {
-        if (ELEMENTS_ALLOCATED == 0) panic("Stack Underflow!", STACK_UNDERFLOW);
+        if (ELEMENTS_ALLOCATED <= 1) panic("Stack Underflow!", STACK_UNDERFLOW);
 
-        uint8_t size = SIZE_STACK[ELEMENTS_ALLOCATED] > SIZE_STACK[ELEMENTS_ALLOCATED - 1] ? 
-          SIZE_STACK[ELEMENTS_ALLOCATED] : SIZE_STACK[ELEMENTS_ALLOCATED - 1];
+        uint16_t n1 = pop_element();
+        Serial.println(n1);
 
-        uint16_t number = pop_element() + pop_element();
+        uint16_t n2 = pop_element();
+        Serial.println(n1);
+        uint16_t number = n1 + n2;
 
-        push_with_size(number, size);
+        push_with_size(number, 2);
         break;
       }
 
@@ -581,16 +582,19 @@ struct OVM {
       case SBS:
         if (!EYE_TARGET) panic("EYE_TARGET is NULL!", EYENULL);
 
-        if (OPERANDS.C) return EYE_TARGET->BlinkAmount(pop_element());
+        if (OPERANDS.C) 
+        {
+          uint16_t num = pop_element();
+          EYE_TARGET->BlinkAmount(num);
+          break;
+        }
 
         EYE_TARGET->BlinkAmount(OPERANDS.AB);
-
-        info("EYE is blinking");
-        Serial.println(OPERANDS.AB);
 
         break;
 
       case SEH:
+      info("ERR");
         if (!EYE_TARGET) panic("EYE_TARGET is NULL!", EYENULL);
 
         if (OPERANDS.C) return EYE_TARGET->LookHorizontal(pop_element());
@@ -598,47 +602,73 @@ struct OVM {
         EYE_TARGET->LookHorizontal(OPERANDS.AB);
 
         break;
+
+      case CAI:
+      info("ERR");
+        if (!OPERANDS.C) return push_with_size((uint16_t)analogRead(OPERANDS.AB), 2);
+
+        uint16_t num = pop_element();
+        push_with_size((uint16_t)analogRead(A0+num), 2);
+        break;
     }
   }
 
+  // Runs an entire cycle
   void run_cycle(void) {
     if (!IS_RUNNING) return;
     
     struct OVM_INSTRUCTION instruction = fetch();
     decode(instruction);
     execute();
-
-    info("");
   }
 };
 
+// Safely initalizes a OVM instance
 void OVM_Init(struct OVM * target, struct _EyeBall * eye_target, struct OVM_PROGRAM program) {
   target->EYE_TARGET = eye_target;
 
   target->STACK_POINTER = target->DATA_STACK;
+
+  target->push_with_size(40, 1);
 
   target->PROGRAM = program;
 }
 
 #pragma endregion
 
+#pragma endregion
 #pragma region UserProgram
 
 // This is my eye
 struct _EyeBall myEye;
 struct OVM myOVM;
 
-struct OVM_INSTRUCTION myProgramInstructions[10] = {
+// this is debug test stuff
+struct OVM_INSTRUCTION myProgramInstructions[100] = {
 };
 
+// Unfounately the version of AVR-GCC in the Arduino IDE is incredibly outdated (either 7 or 12)
+// The point is it does not fully conform to modern C/C++ standards so I can't initalize the array
+// Via non-trivial designated initalizers due to them not being supported :(
+
+// also debug and testing stuff
 void LoadProgram() {
-  myProgramInstructions[0].opcode = SBS;
-  myProgramInstructions[0].arg16 = 100;
+  myProgramInstructions[0].opcode = PUSHS;
+  myProgramInstructions[0].arg16 = 120;
+  myProgramInstructions[0].argA = 1;
 
-  myProgramInstructions[1].opcode = SEH;
-  myProgramInstructions[1].arg16 = 0;
+  myProgramInstructions[1].opcode = PUSHS;
+  myProgramInstructions[1].arg16 = 460;
+  myProgramInstructions[1].argA = 2;
 
-  myProgramInstructions[2].opcode = HALT;
+  myProgramInstructions[2].opcode = DIV;
+  myProgramInstructions[2].arg16 = 0;
+  //myProgramInstructions[2].argA = 1;
+
+  myProgramInstructions[3].opcode = PRINT;
+  //myProgramInstructions[3].argA = 1;
+
+  myProgramInstructions[4].opcode = HALT;
 }
 
 struct OVM_PROGRAM myProgram = (struct OVM_PROGRAM) {
@@ -664,15 +694,19 @@ void setup() {
 
   myEye = LoadEyeball(blinkPin, horizontalServo, JoystickInput);
 
+
   LoadProgram();
 
-  OVM_Init(&myOVM, &myEye, myProgram);
+  OVM_Init(&myOVM, NULL, myProgram);
+
+  myEye.EjectEye();
 }
 
 void loop() {
   // All that just for this absolutely beautiful procedure call right here
   // At least it is now a piece of cake to add more eyes and play around with them :D
-  myOVM.run_cycle();
+
+  myEye.SetBasedOnInputPlusAutoWhenAfk();
 
   delay(10); // We don't want our servos or board to blow up do we
 }
